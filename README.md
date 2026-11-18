@@ -10,6 +10,7 @@ This module provides these models:
 | Model | API | Purpose |
 |---|---|---|
 | [`viam:openvino:mlmodel`](#viamopenvinomlmodel) | `rdk:service:mlmodel` | Runs ONNX, OpenVINO IR, TFLite, TensorFlow and PaddlePaddle models. Works with the stock `vision:mlmodel` service and anything else that speaks the `mlmodel` API. |
+| [`viam:openvino:sam3`](#viamopenvinosam3) | `rdk:service:mlmodel` | Text-prompted SAM3 segmentation, returning every native-resolution proposal and its confidence. |
 | [`viam:openvino:yolo`](#viamopenvinoyolo) | `rdk:service:vision` | Decodes YOLO v5 / v8 / v11 detection outputs (letterbox, decode, NMS) on top of any `mlmodel` service, not only this one. |
 | [`viam:openvino:rf-detr`](#viamopenvinorf-detr) | `rdk:service:vision` | Decodes [RF-DETR](https://github.com/roboflow/rf-detr) detection outputs on top of any `mlmodel` service. |
 | [`viam:openvino:diagnostics`](#viamopenvinodiagnostics) | `rdk:service:generic` | `list_devices`, `get_compiled_properties`, `benchmark` and `stats` via `DoCommand`. |
@@ -503,3 +504,90 @@ Viam's cloud build, started with the viam CLI and restricted to that platform wi
 runs natively on a GitHub `windows-latest` runner (PyInstaller cannot cross-compile from the Linux cloud build
 containers), is smoke-tested with `dist/main.exe --selftest`, and is uploaded as `windows/amd64` for the same version.
 Both jobs need the `viam_key_id` and `viam_key_value` repository secrets.
+
+## `viam:openvino:sam3`
+
+SAM3 accepts one RGB image and one text prompt per `Infer` call. It runs the exported networks through OpenVINO, with CPU preprocessing and geometry glue, including learned affine normalization. `device: GPU` does not mean every operation executes on the GPU. SAM3 requires Python 3.10 or later when running from source; the existing generic services retain their prior Python support.
+
+### Provision the official artifacts
+
+The official Meta checkpoint is not an OpenVINO model. Export it separately using authorized access to `facebook/sam3` on Hugging Face:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements-sam3-export.txt
+# Authenticate with Hugging Face using its normal credential store or HF_TOKEN.
+.venv/bin/python scripts/export_sam3.py --output /absolute/path/to/sam3-artifacts
+```
+
+Alternatively, supply `--checkpoint /path/to/sam3.pt`. Both downloaded/cached and supplied weights are checked against the pinned official checkpoint. Credentials are never included in the bundle.
+
+The exporter pins official Meta and OpenVINO notebook revisions, records explicit CPU/import patches, uses FP32 weights, and creates eight IR network pairs plus geometry configuration, tokenizer vocabulary, provenance/interfaces/checksums and the SAM license. It refuses to replace an existing output; an incomplete export is not published as a usable bundle. The official notebook is experimental, not a production-validation guarantee.
+
+Runtime startup only validates the complete bundle and compiles its networks. It does not fetch weights, convert models, or fall back to original PyTorch-model inference. Keep bundles external to the module executable; compiled caches are device-local and separate. Do not mix files from other exporters or SAM versions. Review Meta's redistribution terms before distributing generated artifacts. Adapted tokenizer code is covered by `third_party/SAM3_LICENSE`.
+
+### Configure
+
+```json
+{
+  "name": "sam3",
+  "api": "rdk:service:mlmodel",
+  "model": "viam:openvino:sam3",
+  "attributes": {
+    "model_dir": "/absolute/path/to/sam3-artifacts",
+    "device": "CPU"
+  }
+}
+```
+
+`model_dir` is required. `device` defaults to `CPU`; explicit `GPU` fails if unavailable, rather than falling back. `cache_dir` optionally overrides the resource-specific compiled cache; `""` disables it. No confidence threshold or queue-size attribute is supported.
+
+| Tensor | Dtype | Shape | Meaning |
+|---|---|---|---|
+| Input `image` | `uint8` | `[H,W,3]` | Nonempty RGB image, no batch dimension |
+| Input `prompt` | `uint8` | `[L]` | Nonempty UTF-8 text bytes, tokenized internally |
+| Output `masks` | `uint8` | `[N,Hm,Wm]` | Binary native-resolution proposal masks |
+| Output `scores` | `float32` | `[N]` | Matching confidence multiplied by presence confidence |
+
+The tokenizer has 32 positions including start/end tokens. Overflow is rejected, not silently truncated. Every final-layer proposal is retained in model query order: no confidence filtering, sorting, top-K, NMS or empty-mask removal. A no-match prompt still returns proposals. The current pinned export produces 200 masks at 288×288, even when the input image has another size.
+
+Native masks cover the entire resized image, not individual object crops. Resize them to the original RGB image dimensions before indexing an aligned depth image. Resizing an already binary mask cannot exactly reproduce resizing mask logits before thresholding; boundary information has been discarded. These outputs are segmentation inputs, not grasp poses.
+
+Only one inference runs per resource. Concurrent calls fail immediately with a busy error; nothing waits in a queue. If the caller cancels or times out, the active computation may continue and capacity remains occupied until it finishes. Closing stops admission and asynchronously waits before releasing model resources.
+
+### Verification status
+
+The pinned official checkpoint was exported to eight FP32 OpenVINO networks and validated against actual IR interfaces. CPU acceptance was exercised on Ubuntu 24.04 x86-64 / Intel Core Ultra 7 356H, using a standalone frozen executable in an isolated directory, not the running robot module. The full regression suite passed 155 tests; one existing optional YOLOv8n integration test was skipped because its external model was not supplied.
+
+| Target CPU validation measurement | Observed value |
+|---|---|
+| Cold AddResource, empty compiled cache | 8.45 s |
+| First real-image Infer RPC round trip | 21.15 s |
+| Native masks | 200 × 288 × 288, uint8 |
+| Serialized InferResponse | 16,589,688 bytes |
+
+These are observations from one validation run, not a throughput benchmark. The run passed metadata/output checks, immediate busy rejection, caller cancellation while work continued, responsive drain, successful and failed SDK recreation, and removal. A no-match prompt retained every proposal. A second image in the same resource lifetime matched its fresh-resource reference exactly for scores and masks.
+
+Independent real-image comparison used the original Meta model, the pinned notebook runtime and this adapter, with the same checkpoint and query order. Adapter and notebook raw mask/matching/presence logits were identical. Against Meta, token IDs and preprocessing were identical, score checks passed (maximum absolute score difference about 2.49e-5), and three binary pixels differed across 16,588,800 mask pixels. The strict raw-mask-logit diagnostic failed for 56 values, with maximum absolute error 0.025154 and mean absolute error 0.000146. The user explicitly accepted this measured difference; the diagnostic threshold was not relaxed and its failure must not be described as a strict raw-logit parity pass. This approval is for the measured case, not a guarantee for every image.
+
+Run transport, cold-start, state-isolation and lifecycle checks with an authorized bundle:
+
+```bash
+venv/bin/python scripts/check_sam3.py \
+  --model-dir /path/to/sam3-artifacts --image /path/to/image.jpg --prompt shoe \
+  --second-image /path/to/another-image.jpg --module-entrypoint dist/main \
+  --report /path/to/rpc-report.json --overlay --exercise-lifecycle
+```
+
+Use the separate export environment for independent numerical diagnostics:
+
+```bash
+.venv/bin/python scripts/compare_sam3.py \
+  --model-dir /path/to/sam3-artifacts --checkpoint /path/to/sam3.pt \
+  --image /path/to/image.jpg --prompt shoe --report /path/to/parity-report.json
+```
+
+The comparison command keeps its strict raw-logit criterion and exits nonzero on diagnostic differences, including the accepted case above. Inspect the per-output report rather than treating an accepted public-output difference as a strict numerical pass.
+
+GPU inference and Windows SAM3 inference were not exercised. Existing Linux/Windows CI build paths remain in place and now exercise SAM3 runtime dependencies; Windows CI was not run during this implementation. Native macOS source execution was exercised, but frozen macOS remains outside the module's supported release platforms. No robot configuration, module reload, motion, registry publishing or deployment to the running stack was performed.
+

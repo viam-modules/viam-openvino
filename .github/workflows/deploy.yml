@@ -48,7 +48,9 @@ jobs:
       - name: Build module
         run: ./setup.sh && ./build.sh
       - name: Smoke test the frozen binary
-        run: ./dist/main.exe --selftest
+        run: |
+          ./dist/main.exe --selftest
+          ./dist/main.exe --selftest-sam3-imports
       - name: Install viam CLI
         run: |
           curl -sSL -o viam.exe https://storage.googleapis.com/packages.viam.com/apps/viam-cli/viam-cli-latest-windows-amd64.exe
