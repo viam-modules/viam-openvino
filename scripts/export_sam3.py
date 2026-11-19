@@ -16,13 +16,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from models.sam3_bundle import HF_REVISION, MODEL_NAMES, NOTEBOOK_REVISION, SAM3_REVISION, file_sha256, load_bundle
 
+# sha256 of sam3.pt at HF_REVISION (the LFS etag); lets offline hosts verify without Hugging Face credentials.
+CHECKPOINT_SHA256 = "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"
+PATCH_SIZE = 14
+# The ViT was pretrained at 336 px (24x24 patches) and tiles its 24x24 position table and attention windows.
+IMAGE_SIZE_MULTIPLE = 336
+
 
 def download(url: str, target: Path) -> None:
     with urllib.request.urlopen(url, timeout=120) as response, target.open("wb") as stream:
         shutil.copyfileobj(response, stream)
 
 
-def prepare_source(work: Path) -> tuple[Path, Path]:
+def prepare_source(work: Path, image_size: int = 1008) -> tuple[Path, Path]:
     archive = work / "sam3.zip"
     download(f"https://github.com/facebookresearch/sam3/archive/{SAM3_REVISION}.zip", archive)
     source = work / "source"
@@ -69,6 +75,29 @@ def prepare_source(work: Path) -> tuple[Path, Path]:
                 text = text.replace(old, new)
                 applied.append({"file": filename, "old": old, "new": new, "count": count})
         path.write_text(text)
+    if image_size != 1008:
+        # Only the image-model builder paths; each must match at least once, never silently no-op.
+        # Checkpoint freqs_cis are RoPE tables computed from the 1008 grid (bit-identical to a fresh 1008 build),
+        # not trained weights; at other sizes keep the model's recomputed tables instead of the mismatched ones.
+        path = source / "sam3" / "model_builder.py"
+        text = path.read_text()
+        for old, new in (
+            ("        img_size=1008,\n", f"        img_size={image_size},\n"),
+            ("_create_position_encoding(precompute_resolution=1008)",
+             f"_create_position_encoding(precompute_resolution={image_size})"),
+            ("        resolution=1008,\n        stride=14,", f"        resolution={image_size},\n        stride=14,"),
+            ("    missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)\n",
+             "    model_state = model.state_dict()\n"
+             "    sam3_image_ckpt = {k: v for k, v in sam3_image_ckpt.items() if not (\n"
+             "        k.endswith('.attn.freqs_cis') and k in model_state and model_state[k].shape != v.shape)}\n"
+             "    missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)\n"),
+        ):
+            count = text.count(old)
+            if not count:
+                raise ValueError(f"model_builder.py no longer contains {old!r}; cannot export at {image_size}")
+            text = text.replace(old, new)
+            applied.append({"file": "model_builder.py", "old": old, "new": new, "count": count})
+        path.write_text(text)
     (work / "cpu_patches.json").write_text(json.dumps(applied, indent=2))
     helper = work / "ov_sam3_helper.py"
     download(
@@ -78,13 +107,15 @@ def prepare_source(work: Path) -> tuple[Path, Path]:
     return source, helper
 
 
-def export(checkpoint: Path, output: Path, checkpoint_revision: str = HF_REVISION) -> None:
+def export(checkpoint: Path, output: Path, checkpoint_revision: str = HF_REVISION, image_size: int = 1008) -> None:
+    if image_size <= 0 or image_size % IMAGE_SIZE_MULTIPLE:
+        raise ValueError(f"image_size must be a positive multiple of {IMAGE_SIZE_MULTIPLE}")
     if output.exists():
         raise ValueError(f"output already exists; refusing to replace it: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sam3-export-", dir=output.parent) as temporary:
         work = Path(temporary)
-        source, helper_path = prepare_source(work)
+        source, helper_path = prepare_source(work, image_size)
         sys.path.insert(0, str(source))
         import torch
         import openvino as ov
@@ -122,13 +153,14 @@ def export(checkpoint: Path, output: Path, checkpoint_revision: str = HF_REVISIO
 
         z = torch.zeros
         convert("text_encoder", helper.Sam3TextEncoderModel(model.backbone.language_backbone), z(1, 32, dtype=torch.long))
-        length, dimension, prompt_length = 72 * 72, 256, 43
+        grid = image_size // PATCH_SIZE
+        length, dimension, prompt_length = grid * grid, 256, 43
         feature, position = z(length, 1, dimension), z(length, 1, dimension)
         prompt, mask = z(prompt_length, 1, dimension), z(1, prompt_length, dtype=torch.bool)
-        convert("transformer_encoder", helper.Sam3TransformerEncoderModel(model.transformer.encoder, 72, 72),
+        convert("transformer_encoder", helper.Sam3TransformerEncoderModel(model.transformer.encoder, grid, grid),
                 (feature, position, prompt, mask))
         decoder = convert("decoder", helper.Sam3TransformerDecoderModel(model.transformer.decoder),
-                (feature, position, z(1), torch.tensor([0]), torch.tensor([[72, 72]]), torch.ones(1, 1, 2), prompt, mask))
+                (feature, position, z(1), torch.tensor([0]), torch.tensor([[grid, grid]]), torch.ones(1, 1, 2), prompt, mask))
         queries = model.transformer.decoder.num_queries
         hs_shape = list(decoder.output(0).shape)
         references_shape = list(decoder.output(1).shape)
@@ -138,7 +170,7 @@ def export(checkpoint: Path, output: Path, checkpoint_revision: str = HF_REVISIO
                                                    model.transformer.decoder.norm),
                 (z(*hs_shape), z(*references_shape), prompt, mask))
         segmentation = convert("segmentation_head", helper.Sam3SegmentationHeadModel(model.segmentation_head),
-                (z(1, 256, 288, 288), z(1, 256, 144, 144), z(1, 256, 72, 72),
+                (z(1, 256, 4 * grid, 4 * grid), z(1, 256, 2 * grid, 2 * grid), z(1, 256, grid, grid),
                  z(1, queries, 256), feature, prompt, mask))
         geometry = model.geometry_encoder
         helper.save_geo_encoder_config(geometry, str(stage))
@@ -147,7 +179,8 @@ def export(checkpoint: Path, output: Path, checkpoint_revision: str = HF_REVISIO
                  z(10, 256, geometry.roi_size, geometry.roi_size), torch.ones(10, 1, dtype=torch.long)))
         convert("geo_cross_attn", helper.Sam3GeoCrossAttnForOV(geometry),
                 (z(10, 1, 256), torch.ones(1, 10, dtype=torch.bool), feature, position))
-        convert("image_encoder", helper.Sam3ImageEncoderModel(model.backbone.vision_backbone, model.backbone.scalp), z(1, 3, 1008, 1008))
+        convert("image_encoder", helper.Sam3ImageEncoderModel(model.backbone.vision_backbone, model.backbone.scalp),
+                z(1, 3, image_size, image_size))
         shutil.copyfile(source / "sam3/assets/bpe_simple_vocab_16e6.txt.gz", stage / "bpe_simple_vocab_16e6.txt.gz")
         shutil.copyfile(source / "LICENSE", stage / "SAM_LICENSE")
         shutil.copyfile(work / "cpu_patches.json", stage / "cpu_patches.json")
@@ -158,7 +191,7 @@ def export(checkpoint: Path, output: Path, checkpoint_revision: str = HF_REVISIO
             "schema_version": 1, "adapter_version": 1, "model_id": "facebook/sam3",
             "checkpoint_revision": checkpoint_revision, "checkpoint_sha256": file_sha256(checkpoint),
             "sam3_revision": SAM3_REVISION, "notebook_revision": NOTEBOOK_REVISION,
-            "precision": "FP32", "image_size": [1008, 1008], "context_length": 32,
+            "precision": "FP32", "image_size": [image_size, image_size], "context_length": 32,
             "output_shape": raw_shape[1:], "models": {name: name + ".xml" for name in MODEL_NAMES},
             "interfaces": interfaces, "geo_config": "geo_config.json", "tokenizer": "bpe_simple_vocab_16e6.txt.gz",
             "preprocess": {"resize": "bilinear", "antialias": True, "mean": [0.5] * 3, "std": [0.5] * 3},
@@ -177,17 +210,17 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--hf-revision", default=HF_REVISION, choices=[HF_REVISION])
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--image-size", type=int, default=1008,
+                        help=f"square input size; a multiple of {IMAGE_SIZE_MULTIPLE} (336, 672, 1008)")
     args = parser.parse_args()
     if args.checkpoint is None:
         from huggingface_hub import hf_hub_download
         checkpoint = Path(hf_hub_download("facebook/sam3", "sam3.pt", revision=args.hf_revision, token=True))
     else:
         checkpoint = args.checkpoint.resolve()
-    from huggingface_hub import get_hf_file_metadata, hf_hub_url
-    metadata = get_hf_file_metadata(hf_hub_url("facebook/sam3", "sam3.pt", revision=args.hf_revision), token=True)
-    if file_sha256(checkpoint) != metadata.etag:
+    if file_sha256(checkpoint) != CHECKPOINT_SHA256:
         raise ValueError("checkpoint does not match the pinned official Hugging Face checkpoint")
-    export(checkpoint, args.output.resolve(), args.hf_revision)
+    export(checkpoint, args.output.resolve(), args.hf_revision, args.image_size)
 
 
 if __name__ == "__main__":

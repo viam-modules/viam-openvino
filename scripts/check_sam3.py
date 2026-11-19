@@ -210,6 +210,19 @@ def save_overlay(image: np.ndarray, values: dict, path: Path) -> dict:
             "resampling": "nearest; binary mask resized after inference", "human_inspection": "not_exercised"}
 
 
+async def expect_still_waiting(awaitable, label: str, seconds: float = 2.0) -> dict:
+    """A queued Infer must neither fail nor finish while the earlier worker still runs; it is abandoned after."""
+    task = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait({task}, timeout=seconds)
+    if done:
+        task.result()
+        raise AssertionError(f"{label}: finished instead of waiting behind the running worker")
+    task.cancel()
+    with suppress(asyncio.CancelledError, GRPCError):
+        await task
+    return {"status": "passed", "waited_seconds": seconds}
+
+
 async def expect_rpc_error(awaitable, label: str, text: str | None = None, status_name: str | None = None) -> dict:
     started = time.monotonic()
     try:
@@ -270,14 +283,14 @@ async def exercise_lifecycle(module, mlmodel, request, cfg, expected_shape, args
         if active.done():
             await active
             raise AssertionError("lifecycle inference finished before an active-work window was observed")
-        result["busy_rejection"] = await expect_rpc_error(
-            mlmodel.Infer(request, timeout=5), "concurrent Infer", "busy")
+        result["concurrent_call_waits"] = await expect_still_waiting(
+            mlmodel.Infer(request, timeout=args.infer_timeout), "concurrent Infer")
         active.cancel()
         with suppress(asyncio.CancelledError):
             await active
         result["caller_cancelled"] = True
-        result["busy_after_caller_cancellation"] = await expect_rpc_error(
-            mlmodel.Infer(request, timeout=5), "Infer after cancellation", "busy")
+        result["waits_after_caller_cancellation"] = await expect_still_waiting(
+            mlmodel.Infer(request, timeout=args.infer_timeout), "Infer after cancellation")
         sampler.phase = "lifecycle_drain_and_warm_recreation"
         started = time.monotonic()
         recreation = asyncio.create_task(module.ReconfigureResource(

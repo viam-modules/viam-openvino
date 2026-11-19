@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from models.sam3_pipeline import decode_inputs, postprocess_proposals
+from models.sam3_pipeline import compile_config, decode_inputs, postprocess_proposals
 
 
 def test_every_proposal_retains_its_mask_and_presence_adjusted_score():
@@ -52,3 +52,20 @@ def test_invalid_prompt_bytes_are_rejected(prompt):
 def test_invalid_image_contract_is_rejected(image):
     with pytest.raises(ValueError):
         decode_inputs({"image": image, "prompt": np.frombuffer(b"bag", dtype=np.uint8)})
+
+
+@pytest.mark.parametrize("device,precision,extra,expected", [
+    ("CPU", None, None, "f32"),
+    ("GPU", None, None, None),
+    ("GPU", "f32", None, "f32"),
+    ("CPU", "f16", None, "f16"),
+    ("GPU", "f32", {"INFERENCE_PRECISION_HINT": "f16"}, "f16"),
+])
+def test_inference_precision_defaults_and_extra_config_precedence(device, precision, extra, expected):
+    assert compile_config(device, "", precision, extra).get("INFERENCE_PRECISION_HINT") == expected
+
+
+def test_extra_config_is_passed_through_and_wins():
+    config = compile_config("GPU", "/cache", "f32", {"GPU_QUEUE_PRIORITY": "HIGH", "PERFORMANCE_HINT": "THROUGHPUT"})
+    assert config == {"PERFORMANCE_HINT": "THROUGHPUT", "INFERENCE_PRECISION_HINT": "f32",
+                      "CACHE_DIR": "/cache", "GPU_QUEUE_PRIORITY": "HIGH"}

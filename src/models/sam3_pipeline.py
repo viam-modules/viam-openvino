@@ -5,8 +5,35 @@
 from __future__ import annotations
 
 from typing import Mapping
+from contextlib import contextmanager
+from time import perf_counter
 
 import numpy as np
+
+
+@contextmanager
+def _profile_stage(timings, name):
+    if timings is None:
+        yield
+        return
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        timings[name] = (perf_counter() - started) * 1000.0
+
+
+def image_transform(size):
+    """RGB uint8 [H,W,3] -> normalized float32 [3,*size]; shared with INT8 calibration."""
+    import torch
+    from torchvision.transforms import v2
+
+    return v2.Compose([
+        v2.ToImage(), v2.ToDtype(torch.uint8, scale=True),
+        v2.Resize(tuple(size), antialias=True),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=[0.5] * 3, std=[0.5] * 3),
+    ])
 
 
 def decode_inputs(input_tensors: Mapping[str, np.ndarray]) -> tuple[np.ndarray, str]:
@@ -59,14 +86,26 @@ def tokenize_prompt(tokenizer, prompt: str) -> np.ndarray:
     return tokens
 
 
+def compile_config(device: str, cache_dir: str = "", inference_precision=None, extra_config=None) -> dict:
+    """OpenVINO properties shared by all eight networks; extra_config is applied last and wins."""
+    config = {"PERFORMANCE_HINT": "LATENCY"}
+    # CPU defaults to f32 for validated FP32 parity; GPU defaults to the plugin's choice (f16) unless overridden.
+    precision = inference_precision or ("f32" if device == "CPU" else None)
+    if precision:
+        config["INFERENCE_PRECISION_HINT"] = precision
+    if cache_dir:
+        config["CACHE_DIR"] = cache_dir
+    config.update(extra_config or {})
+    return config
+
+
 class Sam3Pipeline:
-    def __init__(self, bundle, device: str = "CPU", cache_dir: str = ""):
+    def __init__(self, bundle, device: str = "CPU", cache_dir: str = "", inference_precision=None, extra_config=None):
         import json
         from pathlib import Path
 
         import openvino as ov
         import torch
-        from torchvision.transforms import v2
 
         from .engine import _device_available
         from .sam3_reference import SimpleTokenizer
@@ -80,12 +119,9 @@ class Sam3Pipeline:
         self._requests = {}
         self._closed = False
         self._bundle = bundle
-        config = {"PERFORMANCE_HINT": "LATENCY"}
-        if device == "CPU":
-            config["INFERENCE_PRECISION_HINT"] = "f32"
         if cache_dir:
             Path(cache_dir).mkdir(parents=True, exist_ok=True)
-            config["CACHE_DIR"] = cache_dir
+        config = compile_config(device, cache_dir, inference_precision, extra_config)
         try:
             for name, path in bundle.model_paths.items():
                 compiled = self._core.compile_model(str(path), device, config)
@@ -95,80 +131,85 @@ class Sam3Pipeline:
             self._geo = json.loads(bundle.geo_config_path.read_text())
             self._norm_weight = torch.tensor(self._geo["img_pre_norm_weight"], dtype=torch.float32)
             self._norm_bias = torch.tensor(self._geo["img_pre_norm_bias"], dtype=torch.float32)
-            self._transform = v2.Compose([
-                v2.ToImage(), v2.ToDtype(torch.uint8, scale=True),
-                v2.Resize(tuple(bundle.manifest["image_size"]), antialias=True),
-                v2.ToDtype(torch.float32, scale=True),
-                v2.Normalize(mean=[0.5] * 3, std=[0.5] * 3),
-            ])
+            self._transform = image_transform(bundle.manifest["image_size"])
         except BaseException:
             self.close()
             raise
 
-    def _run(self, name, inputs):
-        request = self._requests[name]
-        request.infer(inputs)
-        # Each network runs once per serialized request; views remain valid until the next request.
-        return [np.asarray(request.get_output_tensor(index).data) for index in range(len(self._compiled[name].outputs))]
+    def _run(self, name, inputs, timings=None):
+        with _profile_stage(timings, name):
+            request = self._requests[name]
+            request.infer(inputs)
+            # Each network runs once per serialized request; views remain valid until the next request.
+            return [np.asarray(request.get_output_tensor(index).data) for index in range(len(self._compiled[name].outputs))]
 
-    def _geometry(self, feature, position, height, width):
+    def _geometry(self, feature, position, height, width, timings=None):
         import torch
         import torch.nn.functional as functional
         from torchvision.ops import roi_align
 
-        cfg = self._geo
-        dimensions = cfg["d_model"]
-        boxes = torch.zeros(10, 1, 4)
-        cx, cy, box_width, box_height = (boxes[:, :, index].flatten() for index in range(4))
-        periods = torch.arange(cfg["pos_enc_num_feats"], dtype=torch.float32)
-        periods = cfg["pos_enc_temperature"] ** (2 * (periods // 2) / cfg["pos_enc_num_feats"])
-        x = cx[:, None] * cfg["pos_enc_scale"] / periods
-        y = cy[:, None] * cfg["pos_enc_scale"] / periods
-        x = torch.stack((x[:, 0::2].sin(), x[:, 1::2].cos()), dim=2).flatten(1)
-        y = torch.stack((y[:, 0::2].sin(), y[:, 1::2].cos()), dim=2).flatten(1)
-        positions = torch.cat((y, x, box_height[:, None], box_width[:, None]), dim=1).view(10, 1, -1)
-        normalized = functional.layer_norm(torch.from_numpy(feature), [dimensions], self._norm_weight, self._norm_bias)
-        normalized = normalized.permute(1, 2, 0).reshape(1, dimensions, height, width)
-        roi = roi_align(normalized, torch.zeros(10, 5), cfg["roi_size"])
+        with _profile_stage(timings, "geometry_cpu"):
+            cfg = self._geo
+            dimensions = cfg["d_model"]
+            boxes = torch.zeros(10, 1, 4)
+            cx, cy, box_width, box_height = (boxes[:, :, index].flatten() for index in range(4))
+            periods = torch.arange(cfg["pos_enc_num_feats"], dtype=torch.float32)
+            periods = cfg["pos_enc_temperature"] ** (2 * (periods // 2) / cfg["pos_enc_num_feats"])
+            x = cx[:, None] * cfg["pos_enc_scale"] / periods
+            y = cy[:, None] * cfg["pos_enc_scale"] / periods
+            x = torch.stack((x[:, 0::2].sin(), x[:, 1::2].cos()), dim=2).flatten(1)
+            y = torch.stack((y[:, 0::2].sin(), y[:, 1::2].cos()), dim=2).flatten(1)
+            positions = torch.cat((y, x, box_height[:, None], box_width[:, None]), dim=1).view(10, 1, -1)
+            normalized = functional.layer_norm(torch.from_numpy(feature), [dimensions], self._norm_weight, self._norm_bias)
+            normalized = normalized.permute(1, 2, 0).reshape(1, dimensions, height, width)
+            roi = roi_align(normalized, torch.zeros(10, 5), cfg["roi_size"])
         projected = self._run("geo_projections", [
             boxes.numpy(), positions.numpy(), roi.numpy(), np.ones((10, 1), dtype=np.int64),
-        ])[0]
-        return self._run("geo_cross_attn", [projected, np.ones((1, 10), dtype=bool), feature, position])
+        ], timings=timings)[0]
+        return self._run("geo_cross_attn", [projected, np.ones((1, 10), dtype=bool), feature, position], timings=timings)
 
-    def _forward(self, image: np.ndarray, prompt: str):
+    def _forward(self, image: np.ndarray, prompt: str, timings=None):
         import torch
 
         if self._closed:
             raise RuntimeError("SAM3 pipeline is closed")
         with torch.inference_mode():
-            tokens = tokenize_prompt(self._tokenizer, prompt)
-            image_tensor = self._transform(image).unsqueeze(0).numpy()
-            image_outputs = self._run("image_encoder", [image_tensor])
-            fpn, positions = image_outputs[:3], image_outputs[3:6]
-            height, width = fpn[2].shape[-2:]
-            feature = fpn[2].reshape(1, 256, -1).transpose(2, 0, 1)
-            position = positions[2].reshape(1, 256, -1).transpose(2, 0, 1)
-            text, text_mask = self._run("text_encoder", [tokens])
-            geometry, geometry_mask = self._geometry(feature, position, height, width)
-            prompt_features = np.concatenate((text, geometry), axis=0)
-            prompt_mask = np.concatenate((text_mask, geometry_mask), axis=1).astype(bool, copy=False)
-            encoded = self._run("transformer_encoder", [feature, position, prompt_features, prompt_mask])
+            with _profile_stage(timings, "tokenization"):
+                tokens = tokenize_prompt(self._tokenizer, prompt)
+            with _profile_stage(timings, "image_preprocess"):
+                image_tensor = self._transform(image).unsqueeze(0).numpy()
+            image_outputs = self._run("image_encoder", [image_tensor], timings=timings)
+            with _profile_stage(timings, "feature_layout"):
+                fpn, positions = image_outputs[:3], image_outputs[3:6]
+                height, width = fpn[2].shape[-2:]
+                feature = fpn[2].reshape(1, 256, -1).transpose(2, 0, 1)
+                position = positions[2].reshape(1, 256, -1).transpose(2, 0, 1)
+            text, text_mask = self._run("text_encoder", [tokens], timings=timings)
+            geometry, geometry_mask = self._geometry(feature, position, height, width, timings=timings)
+            with _profile_stage(timings, "prompt_assembly"):
+                prompt_features = np.concatenate((text, geometry), axis=0)
+                prompt_mask = np.concatenate((text_mask, geometry_mask), axis=1).astype(bool, copy=False)
+            encoded = self._run("transformer_encoder", [feature, position, prompt_features, prompt_mask], timings=timings)
             decoded = self._run("decoder", [
                 encoded[0], encoded[1], np.zeros(1, dtype=np.float32),
                 encoded[3], encoded[4], encoded[5], prompt_features, prompt_mask,
-            ])
-            queries, references = decoded[0].transpose(0, 2, 1, 3), decoded[1].transpose(0, 2, 1, 3)
-            matching = self._run("scoring", [queries, references, prompt_features, prompt_mask])[0]
+            ], timings=timings)
+            with _profile_stage(timings, "query_layout"):
+                queries, references = decoded[0].transpose(0, 2, 1, 3), decoded[1].transpose(0, 2, 1, 3)
+            matching = self._run("scoring", [queries, references, prompt_features, prompt_mask], timings=timings)[0]
             masks = self._run("segmentation_head", [
                 *fpn, queries[-1], encoded[0], prompt_features, prompt_mask,
-            ])[0]
+            ], timings=timings)[0]
             return masks, matching, decoded[2]
 
-    def infer(self, image: np.ndarray, prompt: str) -> dict[str, np.ndarray]:
-        result = postprocess_proposals(*self._forward(image, prompt))
-        if tuple(result["masks"].shape) != tuple(self._bundle.manifest["output_shape"]):
-            raise ValueError("native proposal masks differ from the validated bundle output_shape")
-        return result
+    def infer(self, image: np.ndarray, prompt: str, *, timings=None) -> dict[str, np.ndarray]:
+        with _profile_stage(timings, "pipeline_total"):
+            raw = self._forward(image, prompt, timings=timings)
+            with _profile_stage(timings, "postprocess"):
+                result = postprocess_proposals(*raw)
+                if tuple(result["masks"].shape) != tuple(self._bundle.manifest["output_shape"]):
+                    raise ValueError("native proposal masks differ from the validated bundle output_shape")
+            return result
 
     def close(self) -> None:
         self._closed = True

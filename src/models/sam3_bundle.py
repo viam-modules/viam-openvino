@@ -17,6 +17,83 @@ SAM3_REVISION = "31cb7e624e4fe95301b1be1d4e809111593d2e45"
 NOTEBOOK_REVISION = "343266b9537c5bfb2aad86916fbe0f2c2569250f"
 HF_REVISION = "3c879f39826c281e95690f02c7821c4de09afae7"
 
+NOTEBOOK_COMPRESSION_MODELS = {
+    "image_encoder": {
+        "mode": "INT4_SYM", "group_size": 128, "ratio": 1.0, "group_size_fallback_mode": "IGNORE",
+        "all_layers": False, "backup_mode": "INT8_ASYM",
+    },
+    "text_encoder": {
+        "mode": "INT4_SYM", "group_size": 128, "ratio": 1.0, "group_size_fallback_mode": "IGNORE",
+        "all_layers": False, "backup_mode": "INT8_ASYM",
+    },
+    "transformer_encoder": {"mode": "INT8_ASYM"},
+    "decoder": {"mode": "INT8_ASYM"},
+    "segmentation_head": {"mode": "INT8_ASYM"},
+}
+
+IMAGE_ENCODER_PTQ_RECIPE = "image_encoder_int8_ptq"
+IMAGE_ENCODER_PTQ_MODELS = {
+    "image_encoder": {
+        "mode": "INT8", "model_type": "TRANSFORMER", "quantized": "weight_matmul",
+        "ignored_types": ["Convolution", "ConvolutionBackpropData", "ScaledDotProductAttention"],
+    },
+}
+
+
+def _validate_precision(manifest: Dict[str, Any]) -> None:
+    precision = manifest.get("precision")
+    if precision == "FP32":
+        if "compression" in manifest:
+            raise ValueError("FP32 artifacts cannot declare compression")
+        return
+    if precision != "MIXED":
+        raise ValueError("adapter version 1 requires FP32 or MIXED artifacts with a supported compression recipe")
+    compression = manifest.get("compression")
+    if not isinstance(compression, dict):
+        raise ValueError("MIXED artifacts require complete compression metadata")
+    if compression.get("recipe") == IMAGE_ENCODER_PTQ_RECIPE:
+        _validate_image_encoder_ptq(compression)
+    else:
+        _validate_notebook_compression(compression)
+    if not isinstance(compression["nncf_version"], str) or not compression["nncf_version"].strip():
+        raise ValueError("compression nncf_version must identify the compressor")
+    source_hash = compression["source_manifest_sha256"]
+    if not isinstance(source_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", source_hash):
+        raise ValueError("compression source_manifest_sha256 must be a SHA-256 digest")
+
+
+def _validate_notebook_compression(compression: Dict[str, Any]) -> None:
+    required = {"method", "recipe", "models", "nncf_version", "source_manifest_sha256", "serialization"}
+    if set(compression) != required:
+        raise ValueError("MIXED artifacts require complete notebook compression metadata")
+    if compression["method"] != "nncf.compress_weights" or compression["recipe"] != "notebook_sam3_weight_only":
+        raise ValueError("unsupported compression method or recipe")
+    if compression["models"] != NOTEBOOK_COMPRESSION_MODELS:
+        raise ValueError("compression models must match the pinned notebook recipe")
+    for name in ("image_encoder", "text_encoder"):
+        settings = compression["models"][name]
+        if (type(settings["group_size"]) is not int or type(settings["ratio"]) not in (int, float)
+                or type(settings["all_layers"]) is not bool):
+            raise ValueError("compression group size, ratio and all_layers must use notebook setting types")
+    if compression["serialization"] != {"compress_to_fp16": True} or (
+        type(compression["serialization"]["compress_to_fp16"]) is not bool
+    ):
+        raise ValueError("compression serialization must record notebook FP16 float-constant defaults")
+
+
+def _validate_image_encoder_ptq(compression: Dict[str, Any]) -> None:
+    # Activation+weight INT8 of the image encoder's weight MatMuls only; the other seven networks stay FP32.
+    required = {"method", "recipe", "models", "nncf_version", "source_manifest_sha256", "calibration_samples"}
+    if set(compression) != required:
+        raise ValueError("MIXED artifacts require complete image-encoder INT8 compression metadata")
+    if compression["method"] != "nncf.quantize":
+        raise ValueError("unsupported compression method or recipe")
+    if compression["models"] != IMAGE_ENCODER_PTQ_MODELS:
+        raise ValueError("compression models must match the image-encoder INT8 recipe")
+    samples = compression["calibration_samples"]
+    if type(samples) is not int or samples <= 0:
+        raise ValueError("compression calibration_samples must be a positive integer")
+
 
 @dataclass(frozen=True)
 class Sam3Bundle:
@@ -70,8 +147,7 @@ def load_bundle(model_dir: str) -> Sam3Bundle:
     checkpoint_hash = manifest.get("checkpoint_sha256")
     if not isinstance(checkpoint_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", checkpoint_hash):
         raise ValueError("checkpoint_sha256 must be a SHA-256 digest")
-    if manifest.get("precision") != "FP32":
-        raise ValueError("adapter version 1 requires FP32 artifacts")
+    _validate_precision(manifest)
     for key, expected in (
         ("checkpoint_revision", HF_REVISION),
         ("sam3_revision", SAM3_REVISION),

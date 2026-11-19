@@ -257,13 +257,7 @@ class MLModelConfig:
         num_requests = _opt_positive_int(attrs, "num_requests")
         num_threads = _opt_positive_int(attrs, "num_threads")
 
-        precision = attrs.get("inference_precision")
-        if precision is not None:
-            if not isinstance(precision, str) or precision.lower() not in INFERENCE_PRECISIONS:
-                raise ValueError(
-                    f"inference_precision '{precision}' must be one of {', '.join(INFERENCE_PRECISIONS)}"
-                )
-            precision = precision.lower()
+        precision = parse_inference_precision(attrs)
 
         cache_dir: Optional[str]
         if "cache_dir" in attrs:
@@ -296,10 +290,7 @@ class MLModelConfig:
         if attrs.get("preprocess") is not None:
             preprocess = PreprocessConfig.from_attributes(attrs["preprocess"])
 
-        extra_config = attrs.get("extra_config") or {}
-        if not isinstance(extra_config, Mapping):
-            raise ValueError("extra_config must be an object of OpenVINO properties")
-        extra_config = {str(k): _plain(v) for k, v in extra_config.items()}
+        extra_config = parse_extra_config(attrs)
 
         return cls(
             model_path=model_path,
@@ -330,6 +321,22 @@ def _opt_positive_int(attrs: Mapping[str, Any], key: str) -> Optional[int]:
     if isinstance(v, bool) or not isinstance(v, (int, float)) or int(v) != v or int(v) < 1:
         raise ValueError(f"{key} must be a positive integer")
     return int(v)
+
+
+def parse_inference_precision(attrs: Mapping[str, Any]) -> Optional[str]:
+    precision = attrs.get("inference_precision")
+    if precision is None:
+        return None
+    if not isinstance(precision, str) or precision.lower() not in INFERENCE_PRECISIONS:
+        raise ValueError(f"inference_precision '{precision}' must be one of {', '.join(INFERENCE_PRECISIONS)}")
+    return precision.lower()
+
+
+def parse_extra_config(attrs: Mapping[str, Any]) -> Dict[str, Any]:
+    extra_config = attrs.get("extra_config") or {}
+    if not isinstance(extra_config, Mapping):
+        raise ValueError("extra_config must be an object of OpenVINO properties")
+    return {str(k): _plain(v) for k, v in extra_config.items()}
 
 
 def _plain(v: Any) -> Any:

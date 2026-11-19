@@ -14,8 +14,10 @@ class ControlledPipeline:
         self.finished = threading.Event()
         self.closed = threading.Event()
         self.error = None
+        self.calls = 0
 
-    def infer(self, image, prompt):
+    def infer(self, image, prompt, *, timings=None):
+        self.calls += 1
         self.started.set()
         if not self.release.wait(timeout=10):
             raise TimeoutError("test did not release the worker")
@@ -48,29 +50,53 @@ async def wait_started(pipeline):
     assert await asyncio.to_thread(pipeline.started.wait, 5)
 
 
-async def test_second_request_is_rejected_while_first_worker_runs(controlled_resource):
+async def test_concurrent_request_waits_for_running_worker_then_runs(controlled_resource):
     resource, pipeline = controlled_resource
     first = asyncio.create_task(resource.infer(inputs()))
     await wait_started(pipeline)
-    with pytest.raises(RuntimeError, match="busy"):
-        await resource.infer(inputs())
+    second = asyncio.create_task(resource.infer(inputs()))
+    await asyncio.sleep(0.05)
+    assert not second.done()
+    assert pipeline.calls == 1
     pipeline.release.set()
-    result = await first
-    np.testing.assert_array_equal(result["scores"], [0.75])
+    for result in await asyncio.gather(first, second):
+        np.testing.assert_array_equal(result["scores"], [0.75])
+    assert pipeline.calls == 2
 
 
-async def test_cancelled_caller_does_not_free_active_worker_capacity(controlled_resource):
+async def test_cancelled_running_caller_keeps_worker_and_queued_caller_is_dropped(controlled_resource):
     resource, pipeline = controlled_resource
     first = asyncio.create_task(resource.infer(inputs()))
     await wait_started(pipeline)
+    queued = asyncio.create_task(resource.infer(inputs()))
+    await asyncio.sleep(0)
     first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    with pytest.raises(RuntimeError, match="busy"):
-        await resource.infer(inputs())
+    queued.cancel()
+    for task in (first, queued):
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not pipeline.finished.is_set()
     pipeline.release.set()
     await resource.close()
     assert pipeline.finished.is_set()
+    assert pipeline.calls == 1
+    assert pipeline.closed.is_set()
+
+
+async def test_close_rejects_queued_request_and_drains_running_one(controlled_resource):
+    resource, pipeline = controlled_resource
+    first = asyncio.create_task(resource.infer(inputs()))
+    await wait_started(pipeline)
+    queued = asyncio.create_task(resource.infer(inputs()))
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(resource.close())
+    with pytest.raises(RuntimeError, match="closed before"):
+        await queued
+    assert not pipeline.closed.is_set()
+    pipeline.release.set()
+    await asyncio.wait_for(closing, 5)
+    await first
+    assert pipeline.calls == 1
     assert pipeline.closed.is_set()
 
 
@@ -174,3 +200,30 @@ async def test_cancelled_close_caller_does_not_abandon_worker_cleanup(controlled
     await first
     assert pipeline.finished.is_set()
     assert pipeline.closed.is_set()
+
+
+def sam3_config(tmp_path, **attrs):
+    from test_mlmodel_resource import make_config
+
+    (tmp_path / "manifest.json").write_text("{}")
+    return make_config(name="sam3-attrs", model_dir=str(tmp_path), device="GPU", **attrs)
+
+
+def test_precision_and_extra_config_attributes_are_parsed(tmp_path):
+    from models.sam3_mlmodel import _attributes
+
+    attrs = _attributes(sam3_config(tmp_path, inference_precision="F32",
+                                    extra_config={"GPU_QUEUE_PRIORITY": "HIGH", "NUM_STREAMS": 1}))
+    assert attrs.inference_precision == "f32"
+    assert attrs.extra_config == {"GPU_QUEUE_PRIORITY": "HIGH", "NUM_STREAMS": 1}
+    assert isinstance(attrs.extra_config["NUM_STREAMS"], int)
+
+
+@pytest.mark.parametrize("attrs,match", [
+    ({"inference_precision": "int8"}, "inference_precision"),
+    ({"extra_config": "GPU_QUEUE_PRIORITY=HIGH"}, "extra_config"),
+    ({"num_requests": 2}, "unknown SAM3 attributes"),
+])
+def test_invalid_speed_attributes_fail_at_validation(tmp_path, attrs, match):
+    with pytest.raises(ValueError, match=match):
+        Sam3MLModel.validate_config(sam3_config(tmp_path, **attrs))
