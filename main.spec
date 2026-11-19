@@ -14,7 +14,7 @@ a = Analysis(
     ["src/main.py"],
     pathex=["src"],
     binaries=ov_binaries,
-    datas=ov_datas,
+    datas=ov_datas + [("LICENSE", "."), ("third_party", "third_party")],
     hiddenimports=ov_hiddenimports + ["googleapiclient"],
     hookspath=[],
     hooksconfig={},

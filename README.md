@@ -10,6 +10,7 @@ This module provides these models:
 | Model | API | Purpose |
 |---|---|---|
 | [`viam:openvino:mlmodel`](#viamopenvinomlmodel) | `rdk:service:mlmodel` | Runs ONNX, OpenVINO IR, TFLite, TensorFlow and PaddlePaddle models. Works with the stock `vision:mlmodel` service and anything else that speaks the `mlmodel` API. |
+| [`viam:openvino:sam3`](#viamopenvinosam3) | `rdk:service:mlmodel` | Text-prompted SAM3 segmentation, returning every native-resolution proposal and its confidence. |
 | [`viam:openvino:yolo`](#viamopenvinoyolo) | `rdk:service:vision` | Decodes YOLO v5 / v8 / v11 detection outputs (letterbox, decode, NMS) on top of any `mlmodel` service, not only this one. |
 | [`viam:openvino:rf-detr`](#viamopenvinorf-detr) | `rdk:service:vision` | Decodes [RF-DETR](https://github.com/roboflow/rf-detr) detection outputs on top of any `mlmodel` service. |
 | [`viam:openvino:diagnostics`](#viamopenvinodiagnostics) | `rdk:service:generic` | `list_devices`, `get_compiled_properties`, `benchmark` and `stats` via `DoCommand`. |
@@ -400,8 +401,13 @@ On either release, the packaged `intel-opencl-icd` from Ubuntu's own repositorie
 If viam-server runs as a non-root user, add it to the `render` and `video` groups:
 `sudo usermod -aG render,video <user>`. Verify with `clinfo -l`, which should list an Intel platform and device.
 
+Check `clinfo -l` as the same user that will run inference. An installed runtime with inaccessible
+`/dev/dri/renderD*` nodes is a permissions problem, not evidence that drivers need upgrading.
+`first_run.sh` reports this case without requesting a GPU runtime upgrade. After approved group changes,
+use a fresh login for standalone checks; an already-running service keeps its previous groups.
+
 The apt packages can lag new GPUs: Intel's noble repository still ships the 24.39 runtime, which loads but lists no
-device on Panther Lake (Arc B-series iGPU). If `clinfo -l` shows no Intel GPU, install the `.deb` packages of the latest
+device on Panther Lake (Arc B-series iGPU). If render nodes are accessible but `clinfo -l` shows no Intel GPU, install the `.deb` packages of the latest
 [intel/compute-runtime release](https://github.com/intel/compute-runtime/releases) plus the two
 `intel-graphics-compiler` packages its release notes link, following the steps in those notes
 (`sha256sum`, then `sudo dpkg -i *.deb`). The module's `first_run.sh` does this automatically when the apt
@@ -503,3 +509,132 @@ Viam's cloud build, started with the viam CLI and restricted to that platform wi
 runs natively on a GitHub `windows-latest` runner (PyInstaller cannot cross-compile from the Linux cloud build
 containers), is smoke-tested with `dist/main.exe --selftest`, and is uploaded as `windows/amd64` for the same version.
 Both jobs need the `viam_key_id` and `viam_key_value` repository secrets.
+
+## `viam:openvino:sam3`
+
+SAM3 accepts one RGB image and one text prompt per `Infer` call. It runs the exported networks through OpenVINO, with CPU preprocessing and geometry glue, including learned affine normalization. `device: GPU` does not mean every operation executes on the GPU. SAM3 requires Python 3.10 or later when running from source; the existing generic services retain their prior Python support.
+
+### Provision the official artifacts
+
+The official Meta checkpoint is not an OpenVINO model. Export it separately using authorized access to `facebook/sam3` on Hugging Face:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements-sam3-export.txt
+# Authenticate with Hugging Face using its normal credential store or HF_TOKEN.
+.venv/bin/python scripts/export_sam3.py --output /absolute/path/to/sam3-artifacts
+```
+
+Alternatively, supply `--checkpoint /path/to/sam3.pt`. Both downloaded/cached and supplied weights are checked against the pinned official checkpoint SHA-256, so a supplied checkpoint needs no Hugging Face credentials. Credentials are never included in the bundle.
+
+`--image-size` (default `1008`) exports at another square input size; it must be a multiple of 336, the backbone's pretraining size. `672` cuts image-encoder compute about 2.4× and produces 192×192 native masks. The checkpoint's precomputed RoPE tables for the four global-attention blocks are tied to the 1008 grid; at other sizes the exporter keeps the model's recomputed tables, which are bit-identical to the checkpoint's at 1008. Accuracy away from 1008 is not validated by Meta; check masks on your own scenes.
+
+The exporter pins official Meta and OpenVINO notebook revisions, records explicit CPU/import patches, uses FP32 weights, and creates eight IR network pairs plus geometry configuration, tokenizer vocabulary, provenance/interfaces/checksums and the SAM license. It refuses to replace an existing output; an incomplete export is not published as a usable bundle. The official notebook is experimental, not a production-validation guarantee.
+
+Runtime startup only validates the complete bundle and compiles its networks. It does not fetch weights, convert models, or fall back to original PyTorch-model inference. Keep bundles external to the module executable; compiled caches are device-local and separate. Do not mix files from other exporters or SAM versions. Review Meta's redistribution terms before distributing generated artifacts. Adapted tokenizer code is covered by `third_party/SAM3_LICENSE`.
+
+### Configure
+
+```json
+{
+  "name": "sam3",
+  "api": "rdk:service:mlmodel",
+  "model": "viam:openvino:sam3",
+  "attributes": {
+    "model_dir": "/absolute/path/to/sam3-artifacts",
+    "device": "CPU"
+  }
+}
+```
+
+`model_dir` is required. `device` defaults to `CPU`; explicit `GPU` fails if unavailable, rather than falling back. `cache_dir` optionally overrides the resource-specific compiled cache; `""` disables it. No confidence threshold or queue-size attribute is supported.
+
+`inference_precision` (`f32`, `f16` or `bf16`) and `extra_config` (OpenVINO properties passed to `compile_model`) have the same meaning as on `viam:openvino:mlmodel` and apply to all eight networks; `extra_config` is applied last and wins. Without `inference_precision`, CPU compiles in `f32` and GPU uses the plugin default (`f16`). On the Intel Core Ultra 7 356H iGPU, the 672 image encoder measured 1.91 s median at `f32` versus 2.53 s at `f16` (`benchmark_app`, latency hint, 5 iterations), so set `"inference_precision": "f32"` for GPU. For example, to also prioritize SAM3 over other GPU users:
+
+```json
+"attributes": {
+  "model_dir": "/absolute/path/to/sam3-artifacts",
+  "device": "GPU",
+  "inference_precision": "f32",
+  "extra_config": {"MODEL_PRIORITY": "HIGH", "GPU_QUEUE_PRIORITY": "HIGH", "GPU_QUEUE_THROTTLE": "HIGH"}
+}
+```
+
+| Tensor | Dtype | Shape | Meaning |
+|---|---|---|---|
+| Input `image` | `uint8` | `[H,W,3]` | Nonempty RGB image, no batch dimension |
+| Input `prompt` | `uint8` | `[L]` | Nonempty UTF-8 text bytes, tokenized internally |
+| Output `masks` | `uint8` | `[N,Hm,Wm]` | Binary native-resolution proposal masks |
+| Output `scores` | `float32` | `[N]` | Matching confidence multiplied by presence confidence |
+
+The tokenizer has 32 positions including start/end tokens. Overflow is rejected, not silently truncated. Every final-layer proposal is retained in model query order: no confidence filtering, sorting, top-K, NMS or empty-mask removal. A no-match prompt still returns proposals. The bundle's native mask size is fixed by its export (288×288 at 1008, 192×192 at 672), independent of the input image size; read it from metadata.
+
+Native masks cover the entire resized image, not individual object crops. Resize them to the original RGB image dimensions before indexing an aligned depth image. Resizing an already binary mask cannot exactly reproduce resizing mask logits before thresholding; boundary information has been discarded. These outputs are segmentation inputs, not grasp poses.
+
+Only one inference runs per resource. As with `viam:openvino:mlmodel`, concurrent calls wait in first-in, first-out order rather than failing; at CPU latencies, set caller deadlines long enough to cover the queue. A caller that cancels or times out while waiting is dropped. If it cancels while its inference is running, the computation continues and later calls wait until it finishes. Closing fails still-waiting calls, then waits for the running one before releasing model resources.
+
+### Stage-level DEBUG profiling
+
+Once the profiling code is installed, enable DEBUG for the SAM3 resource. In the service's JSON configuration, merge this field at the top level, not inside `attributes`:
+
+```json
+{
+  "log_configuration": {
+    "level": "DEBUG"
+  }
+}
+```
+
+Keep the existing `Infer` call unchanged. There is no `extra.profile` switch or new tensor output. INFO or higher disables timing collection and profile logs. Ensure any module/log-view filters also allow DEBUG messages.
+
+Each completed worker emits one JSON DEBUG message with `event: sam3_infer_profile`. It records:
+
+- `stages_ms`: tokenization, image preprocessing, feature layout, all eight named OpenVINO networks, CPU geometry preparation, prompt assembly, query layout and postprocessing.
+- `pipeline_total`: an inclusive entry inside `stages_ms`; do not add it to the component stage values.
+- `worker_ms`, `input_validation_ms`, `unattributed_pipeline_ms`, configured `device`, `input_shape`, and successful output array bytes.
+- `status` and `error_type`: failed workers retain the timings collected up to the failure. Caller cancellation does not stop the worker's eventual profiling record.
+
+Network-stage measurements surround synchronous `InferRequest.infer` and output access. They include associated host/device transfers and synchronization; they are not GPU-kernel-only timings. Camera capture, RPC tensor decoding/encoding, network transport and startup compilation are outside these worker timings. First-inference lazy backend work is included in the stage that performs it. Compare with client round-trip measurements without assuming all remaining time is network.
+
+Profiles never log prompt content, image pixels, masks or scores. Profiling state belongs to one worker and is not reused across requests.
+
+### Verification status
+
+The pinned official checkpoint was exported to eight FP32 OpenVINO networks and validated against actual IR interfaces. CPU acceptance was exercised on Ubuntu 24.04 x86-64 / Intel Core Ultra 7 356H, using a standalone frozen executable in an isolated directory, not the running robot module. The full regression suite passed 155 tests; one existing optional YOLOv8n integration test was skipped because its external model was not supplied.
+
+| Target CPU validation measurement | Observed value |
+|---|---|
+| Cold AddResource, empty compiled cache | 8.45 s |
+| First real-image Infer RPC round trip | 21.15 s |
+| Native masks | 200 × 288 × 288, uint8 |
+| Serialized InferResponse | 16,589,688 bytes |
+
+These are observations from one validation run, not a throughput benchmark. The run passed metadata/output checks, caller cancellation while work continued, responsive drain, successful and failed SDK recreation, and removal; it predates FIFO queueing and checked the earlier immediate busy rejection instead. A no-match prompt retained every proposal. A second image in the same resource lifetime matched its fresh-resource reference exactly for scores and masks.
+
+Independent real-image comparison used the original Meta model, the pinned notebook runtime and this adapter, with the same checkpoint and query order. Adapter and notebook raw mask/matching/presence logits were identical. Against Meta, token IDs and preprocessing were identical, score checks passed (maximum absolute score difference about 2.49e-5), and three binary pixels differed across 16,588,800 mask pixels. The strict raw-mask-logit diagnostic failed for 56 values, with maximum absolute error 0.025154 and mean absolute error 0.000146. The user explicitly accepted this measured difference; the diagnostic threshold was not relaxed and its failure must not be described as a strict raw-logit parity pass. This approval is for the measured case, not a guarantee for every image.
+
+Run transport, cold-start, state-isolation and lifecycle checks with an authorized bundle:
+
+```bash
+venv/bin/python scripts/check_sam3.py \
+  --model-dir /path/to/sam3-artifacts --image /path/to/image.jpg --prompt shoe \
+  --second-image /path/to/another-image.jpg --module-entrypoint dist/main \
+  --report /path/to/rpc-report.json --overlay --exercise-lifecycle
+```
+
+Use the separate export environment for independent numerical diagnostics:
+
+```bash
+.venv/bin/python scripts/compare_sam3.py \
+  --model-dir /path/to/sam3-artifacts --checkpoint /path/to/sam3.pt \
+  --image /path/to/image.jpg --prompt shoe --report /path/to/parity-report.json
+```
+
+The comparison command keeps its strict raw-logit criterion and exits nonzero on diagnostic differences, including the accepted case above. Inspect the per-output report rather than treating an accepted public-output difference as a strict numerical pass.
+
+GPU dispatch was subsequently exercised through the running root-owned module on the Intel iGPU: two fresh `cam` captures with prompt `bag of chips` returned all proposals in 11.68s and 8.41s. Earlier CPU captures took 23.98s and 18.65s. These are different captures, not a controlled same-image benchmark or numerical GPU/CPU parity proof. The top GPU masks visibly outlined chip bags. Enabling this required only changing the service attribute to `device: GPU`; no pipeline code, driver installation, permission change or additional module reload was needed. The separate provisioning-permission fix does not account for this acceleration.
+
+The validated FP32 artifact bundle was published privately as `viam:sam3-openvino-fp32` version `0.1.0`. The live resource still uses its existing local artifact directory; switching to a registry package reference is a separate configuration step.
+
+Windows SAM3 inference and Windows CI were not exercised here. Native macOS source execution was exercised, but frozen macOS remains outside the module's supported release platforms. No robot motion was performed.
+

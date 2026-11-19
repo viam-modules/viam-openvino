@@ -1,0 +1,13 @@
+# Install in a separate compression-only venv; do not alter the module runtime.
+# compress_sam3.py: pinned notebook recipe (INT4_SYM encoders, INT8_ASYM transformer/decoder/segmentation).
+# quantize_sam3_image_encoder.py: INT8 post-training quantization of the image encoder; torch/torchvision/pillow
+# reproduce the runtime preprocessing for calibration frames.
+--extra-index-url https://download.pytorch.org/whl/cpu
+openvino==2026.4.0
+nncf==3.4.0
+numpy==2.4.6
+torch==2.9.1+cpu; sys_platform != "darwin"
+torchvision==0.24.1+cpu; sys_platform != "darwin"
+torch==2.9.1; sys_platform == "darwin"
+torchvision==0.24.1; sys_platform == "darwin"
+pillow>=10.0

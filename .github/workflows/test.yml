@@ -40,3 +40,5 @@ jobs:
           PY
           if [ -f dist/main.exe ]; then BIN=./dist/main.exe; else BIN=./dist/main; fi
           VIAM_OPENVINO_SELFTEST_MODEL=selftest.xml "$BIN" --selftest
+          "$BIN" --selftest-sam3-imports
+          echo "Real SAM3 inference is not exercised by this dependency smoke; use scripts/check_sam3.py with an authorized bundle."

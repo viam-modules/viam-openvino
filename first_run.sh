@@ -78,6 +78,15 @@ gpu_runtime_ok() {
     gpu_runtime_files && command -v clinfo >/dev/null 2>&1 \
         && clinfo -l 2>/dev/null | awk '/^Platform/ { p = ($0 ~ /Intel.*Graphics/) } p && /Device/ { f = 1 } END { exit !f }'
 }
+gpu_access_denied() {
+    seen_node=0
+    for node in /dev/dri/renderD*; do
+        [ -e "$node" ] || continue
+        seen_node=1
+        [ -r "$node" ] && [ -w "$node" ] && return 1
+    done
+    [ "$seen_node" = 1 ]
+}
 npu_runtime_ok() { have_lib libze_intel_vpu || have_lib libze_intel_npu; }
 npu_kernel_ok()  { ls /dev/accel/accel* >/dev/null 2>&1; }
 npu_module_available() { modinfo intel_vpu >/dev/null 2>&1; }
@@ -86,6 +95,9 @@ ze_loader_ok()   { have_lib libze_loader.so.1; }
 NEED_GPU=0; NEED_NPU=0
 if [ $HAVE_GPU = 1 ]; then
     if gpu_runtime_ok; then log "GPU compute runtime installed and lists the GPU (clinfo)"
+    elif gpu_runtime_files && gpu_access_denied; then
+        warn "GPU runtime installed, but this process has no read/write permission on any /dev/dri/renderD* node."
+        warn "Fix render-group membership and start a new session before checking drivers; not requesting a GPU runtime upgrade."
     elif gpu_runtime_files; then NEED_GPU=1; log "GPU compute runtime is installed but clinfo lists no Intel GPU (clinfo missing, or runtime too old for this GPU)"
     else NEED_GPU=1; log "GPU compute runtime (OpenCL / Level Zero) is missing"; fi
 fi
